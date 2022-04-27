@@ -1,0 +1,187 @@
+## 用进程处理多个用户的请求，重写run, finish_requst使得请求能够被分发，进程一直运行
+from socketserver import *
+import time
+from multiprocessing import Process, Manager
+import os
+
+HOST = '127.0.0.1'
+PORT = 0
+MAX_SIZE = 1464
+SEQ_NUM = 1
+SEQ_NUM1 = 1
+LEN = 0
+REPLY = ''
+CHECK = False
+OVER = False
+DICT = {}
+timeThread = None
+processdict = Manager().dict()
+SERVER = None
+class MyHandler(BaseRequestHandler):
+    def judge(self,a,b,c,d,e,f):
+        return 256*a+b == c and 256*d+e == f
+
+    def carry_around_add(self,a, b):
+        c = a + b
+        return (c & 0xffff) + (c >> 16)
+
+
+    def checkSum(self,message):
+        b_str = message
+        if len(b_str) % 2 == 1:
+            b_str += b'\0'
+        checksum = 0
+        for i in range(0, len(b_str), 2):
+            w = b_str[i] + (b_str[i+1] << 8)
+            checksum = self.carry_around_add(checksum, w)
+        return ~checksum & 0xffff
+    
+    def handle(self):
+        global SEQ_NUM,SEQ_NUM1,DICT, REPLY, LEN, OVER, timeThread, CHECK
+        packet = self.request[0].strip()
+        data = packet[8:].split(b"\x00")[0].decode().strip()
+        packetarray = bytearray(packet)
+        flag = "{:08b}".format(packet[6])
+        socket = self.request[1]
+        # data_bite = ''.join([bin(ord(c)).replace('0b','') for c in data])
+        client_address = self.client_address
+        def retrans():
+            while True:
+                time.sleep(4)
+                socket.sendto(DICT[SEQ_NUM1-1], client_address)    
+        if (packet[6] == 32 or (packet[6] == 36 and 256*packet[4]+packet[5]==self.checkSum(packet[8:]))) and self.judge(packet[0],packet[1],1,packet[2],packet[3],0):
+            if flag[5]=='1':
+                CHECK = True
+            if os.path.isfile(data):
+                with open(data, 'r') as content:
+                    for line in content:
+                        REPLY = REPLY + line
+                REPLY = REPLY.encode()
+                LEN = len(REPLY)
+                REPLY = bytearray(REPLY)
+                packetarray[6] = 16
+                if LEN > MAX_SIZE:
+                    packetarray[8:1472] = REPLY[:MAX_SIZE]
+                    REPLY = REPLY[MAX_SIZE:]
+                    LEN = LEN - MAX_SIZE
+                else:
+                    REPLY2 = bytearray(MAX_SIZE)
+                    REPLY2[:LEN] =  REPLY
+                    packetarray[8:] = REPLY2
+                    OVER = True
+            else:
+                REPLY2 = bytearray(MAX_SIZE)
+                packetarray[6] = 8
+                packetarray[8:1472] = REPLY2[:MAX_SIZE]
+            if CHECK:
+                chenum = self.checkSum(packetarray[8:]) 
+                packetarray[4] = chenum//256
+                packetarray[5] = chenum%256
+                packetarray[6] +=4
+            else:
+                packetarray[4] = 0
+                packetarray[5] = 0
+            DICT[SEQ_NUM1] = packetarray
+            socket.sendto(packetarray, client_address)    
+            SEQ_NUM += 1
+            SEQ_NUM1 += 1
+            timeThread = Process(target=retrans)
+            timeThread.start()
+        elif flag[3]=='1' and self.judge(packet[0],packet[1],SEQ_NUM,packet[2],packet[3],SEQ_NUM1-1):
+            sumclient = 256*packet[4]+packet[5]
+            if (CHECK and sumclient == self.checkSum(packet[8:]) and flag[5] =='1') or (not CHECK and sumclient == 0 and flag[5] == '0'):
+                if (not CHECK and packet[6] == 80) or (CHECK and packet[6] == 84):
+                    if timeThread != None:
+                        timeThread.terminate()
+                        timeThread.join()
+                    socket.sendto(DICT[SEQ_NUM1-1], client_address) 
+                    SEQ_NUM += 1
+                    timeThread = Process(target=retrans)
+                    timeThread.start()
+                elif (not CHECK and packet[6] == 144) or (CHECK and packet[6] == 148):
+                    if timeThread != None:
+                        timeThread.terminate()
+                        timeThread.join()
+                    REPLY2 = bytearray(MAX_SIZE)
+                    packetarray[0] = SEQ_NUM1 //256
+                    packetarray[1] = SEQ_NUM1 % 256
+                    packetarray[2] = 0
+                    packetarray[3] = 0
+                    if OVER:
+                        packetarray[6] = 8
+                        packetarray[8:1472] = REPLY2[:MAX_SIZE]
+                    else:
+                        packetarray[6] = 16
+                        if LEN > MAX_SIZE:
+                            packetarray[8:1472] = REPLY[:MAX_SIZE]
+                            REPLY = REPLY[MAX_SIZE:]
+                            LEN = LEN - MAX_SIZE
+                        else:
+                            REPLY2 = bytearray(MAX_SIZE)
+                            REPLY2[:LEN] = REPLY
+                            packetarray[8:] = REPLY2
+                            OVER = True
+                    if CHECK:
+                        packetarray[4] = self.checkSum(packetarray[8:])//256
+                        packetarray[5] = self.checkSum(packetarray[8:])%256
+                        packetarray[6]+= 4
+                    DICT[SEQ_NUM1+1] = packetarray
+                    socket.sendto(packetarray, client_address)    
+                    SEQ_NUM += 1
+                    SEQ_NUM1 += 1
+                    timeThread = Process(target=retrans)
+                    timeThread.start()
+        elif flag[4] =='1' and self.judge(packet[0],packet[1],SEQ_NUM,packet[2],packet[3],SEQ_NUM1-1):
+            sumclient = 256*packetarray[4]+packetarray[5]
+            if (CHECK and sumclient == self.checkSum(packet[8:]) and flag[5] =='1') or (not CHECK and sumclient == 0 and flag[5] == '0'):
+                if (CHECK and packet[6] == 76) or (not CHECK and packet[6] == 72):
+                    if timeThread != None:
+                        timeThread.terminate()
+                        timeThread.join()
+                    socket.sendto(DICT[SEQ_NUM1-1], client_address) 
+                    SEQ_NUM += 1
+                    timeThread = Process(target=retrans)
+                    timeThread.start()
+                elif (not CHECK and packet[6] == 136) or (CHECK and packet[6] == 140):
+                    if timeThread != None:
+                        timeThread.terminate()
+                        timeThread.join()
+                    packetarray[0] = SEQ_NUM1 // 256
+                    packetarray[1] = SEQ_NUM1 % 256
+                    packetarray[2] = packet[0]
+                    packetarray[3] = packet[1]
+                    socket.sendto(packetarray, client_address)
+                    SEQ_NUM = 1
+                    SEQ_NUM1 = 1
+                    LEN = 0
+                    REPLY = ''
+                    CHECK = False
+                    OVER = False
+                    DICT = {}
+                    timeThread = None
+
+                    
+                
+class MyUDPServer(UDPServer):
+    def finish_request(self, request, client_address):
+        if client_address in processdict:
+            processdict[client_address] = [request,client_address,1]
+        else:
+            processdict[client_address] = [request,client_address,1]
+            MyProcess(args = (client_address,)).start()
+
+class MyProcess(Process):
+    def run(self):
+        while True:
+            args = self._args[0]
+            data = processdict[args]
+            if data[2] == 1:
+                processdict[args] = [data[0], data[1], 0]
+                SERVER.RequestHandlerClass(data[0], data[1], SERVER)
+if __name__ == '__main__':
+    server = MyUDPServer((HOST,PORT), MyHandler)
+    SERVER = server
+    with server:
+        addr, port = server.server_address
+        print(port, flush = True)
+        server.serve_forever()
